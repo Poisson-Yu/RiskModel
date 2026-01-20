@@ -742,3 +742,111 @@ def scoretofico(pred, Pdo, Base, Odds):
 
     return APScore
 
+
+
+#optuna调参过程结果保存
+from datetime import datetime
+class TrialSaver:
+    def __init__(self, output_dir="./results", experiment_name="exp"):
+        self.output_dir = output_dir
+        self.experiment_name = experiment_name
+        self.filename = f"{output_dir}/{experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    
+    def __call__(self, study, trial):
+    
+        # 构造一行数据：包含 trial number、所有超参、目标值
+        # row = {"trial_number": trial.number, 'trial_params':trial.params}
+        row = {"trial_number": trial.number, 'trial_params':trial.params}
+        row.update(trial.user_attrs)
+        # print(trial.params)
+        
+        # 转为 DataFrame
+        df = pd.DataFrame([row])
+        
+        #追加模式
+        if not os.path.exists(self.filename):
+            df.to_csv(self.filename, index=False)
+        else:
+            df.to_csv(self.filename, mode='a', header=False, index=False)
+
+
+
+
+#训练样本信息统计脚本
+def calc_binary_stats_multi(
+    dfs: Union[List[pd.DataFrame], Dict[str, pd.DataFrame]],
+    y_label: str,
+    pos_label=1,
+    na_values=None,  # 可选：额外指定哪些值视为空（如 ["", "N/A"]）
+    stat_missing = False
+    ) -> pd.DataFrame:
+    """
+    对多个 DataFrame 计算二分类标签的样本统计信息，自动忽略标签为空的样本。
+    
+    空值包括：np.nan, None, pd.NA, pd.NaT，以及可选的自定义空值。
+    
+    Parameters:
+    ----------
+    dfs : list 或 dict of DataFrames
+    y_label : str
+        标签列名
+    pos_label : int/str, default=1
+        正样本的取值
+    na_values : list, optional
+        额外视为空值的值，如 ["", "NULL"]
+        
+    Returns:
+    -------
+    pd.DataFrame : 包含 total（有效样本数）、positive_count、positive_rate
+    """
+    results = {}
+
+    if isinstance(dfs, dict):
+        named_dfs = dfs
+    elif isinstance(dfs, list):
+        named_dfs = {f"df_{i}": df for i, df in enumerate(dfs)}
+    else:
+        raise TypeError("`dfs` 必须是 list 或 dict")
+
+    for name, df in named_dfs.items():
+        if y_label not in df.columns:
+            raise ValueError(f"DataFrame '{name}' 缺少列 '{y_label}'")
+        
+        y = df[y_label].copy()
+
+        # Step 1: 标记空值（内置 NaN/None + 自定义空值）
+        is_na = y.isna()  # 处理 np.nan, None, pd.NA 等
+        
+        if na_values:
+            # 将用户指定的值也标记为空
+            for val in na_values:
+                is_na = is_na | (y == val)
+        
+        # Step 2: 只保留非空样本
+        y_valid = y[~is_na]
+        
+        total_valid = len(y_valid)
+        if total_valid == 0:
+            pos_count = 0
+            pos_rate = 0.0
+        else:
+            pos_count = (y_valid == pos_label).sum()
+            pos_rate = pos_count / total_valid
+
+        if stat_missing:
+            results[name] = {
+                "total_valid": int(total_valid),      # 有效样本数（非空标签）
+                "pos_count": int(pos_count),
+                "pos_rate": float(pos_rate),
+                "missing_count": int(is_na.sum())     # 可选：记录缺失数
+            }
+        else:
+            results[name] = {
+                "total_valid": int(total_valid),      # 有效样本数（非空标签）
+                "pos_count": int(pos_count),
+                "pos_rate": float(pos_rate)
+            }
+
+    result_df = pd.DataFrame(results).T
+    # result_df.index.name = "dataset"
+    return result_df
