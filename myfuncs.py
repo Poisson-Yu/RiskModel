@@ -10,6 +10,9 @@ from optbinning import OptimalBinning
 
 import statsmodels.api as sm
 
+from datetime import datetime
+from typing import List, Dict, Union, Optional
+
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import precision_score
@@ -19,6 +22,7 @@ from sklearn.metrics import roc_curve
 from sklearn.metrics import f1_score
 from sklearn.metrics import auc
 from sklearn.metrics import average_precision_score
+
 
 
 #md5编码
