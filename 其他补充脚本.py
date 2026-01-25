@@ -212,3 +212,34 @@ study = optuna.create_study(directions=["maximize", 'minimize'])
 func = lambda trial: objective(trial, train[fea_obj], y_train, test[fea_obj], y_test, df_oot[fea_obj], df_oot[y_label], df_oot1[fea_obj], df_oot1[y_label], fea_cat_obj)
 # study.optimize(func, n_trials=5, callbacks=[save_trial_callback])
 study.optimize(func, n_trials=5, callbacks=[saver])
+
+
+
+
+
+
+# lgbm解析脚本调用案例
+parser = LGBMTreeParser(lgbm)
+df_nodes = parser.get_nodes_with_sample_counts(test[feas])
+f_map = {i: name for i, name in enumerate(lgbm.feature_name())}
+df_nodes['feature_name'] = df_nodes['split_feature'].map(f_map)
+print("\n=== 基于 'mean_concave_points' 的分裂情况 ===")
+target_feat = 'mean_concave_points'
+splits = df_nodes[
+    (~df_nodes['is_leaf']) & 
+    (df_nodes['feature_name'] == target_feat)
+]
+if not splits.empty:
+    print(splits[['tree_index', 'depth', 'threshold', 'gain']].head())
+
+# 2.3 可视化第一棵树
+print("\n=== 第0棵树的结构可视化 ===")
+parser.print_tree_structure(tree_index=0)
+
+
+
+
+
+
+
+
