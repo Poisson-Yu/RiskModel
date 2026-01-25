@@ -12,6 +12,7 @@ import statsmodels.api as sm
 
 from datetime import datetime
 from typing import List, Dict, Union, Optional
+from collections import Counter
 
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import accuracy_score
@@ -854,3 +855,172 @@ def calc_binary_stats_multi(
     result_df = pd.DataFrame(results).T
     # result_df.index.name = "dataset"
     return result_df
+
+
+# LGBM模型结构拆解及样本路径和样本占比计算
+class LGBMTreeParser:
+    def __init__(self, booster: lgb.Booster):
+        if not isinstance(booster, lgb.Booster):
+            raise TypeError("Input must be a lightgbm.Booster object")
+        
+        self.booster = booster
+        self.model_json = self.booster.dump_model()
+        self.trees = self.model_json['tree_info']
+
+    def _parse_node_with_counts(self, node_data, tree_index, leaf_counts, depth=0, parent_index=None, node_type='root'):
+        """
+        递归解析节点，并动态计算样本数量 (Sample Counts)
+        """
+        nodes_list = []
+        
+        # 1. 初始化当前节点的基本信息
+        current_node = {
+            'tree_index': tree_index,
+            'depth': depth,
+            'parent_index': parent_index,
+            'node_type': node_type,
+            'sample_count': 0  # 初始化计数
+        }
+
+        # 2. 判断节点类型
+        if 'leaf_index' in node_data:
+            # === 叶子节点 ===
+            leaf_idx = node_data['leaf_index']
+            
+            # 关键点：从外部传入的 leaf_counts 字典中获取该叶子的样本数
+            # leaf_counts 是一个字典: {leaf_index: count}
+            count = leaf_counts.get(leaf_idx, 0)
+            
+            current_node.update({
+                'is_leaf': True,
+                'leaf_index': leaf_idx,
+                'leaf_value': node_data.get('leaf_value'),
+                'sample_count': count, # 填入实际统计值
+                # 填充空缺字段保持 DataFrame 结构一致
+                'split_feature': None,
+                'threshold': None,
+                'gain': None
+            })
+            nodes_list.append(current_node)
+            
+            # 返回当前节点的 list 和 当前节点的 count (供父节点累加)
+            return nodes_list, count
+        
+        else:
+            # === 分裂节点 ===
+            current_node.update({
+                'is_leaf': False,
+                'split_index': node_data.get('split_index'),
+                'split_feature': node_data.get('split_feature'),
+                'threshold': node_data.get('threshold'),
+                'gain': node_data.get('split_gain'),
+                'decision_type': node_data.get('decision_type'),
+                'internal_value': node_data.get('internal_value')
+            })
+            
+            # 先占位，稍后算出子节点总和后更新
+            # 注意：我们需要先递归处理子节点，才能算出当前节点的 count
+            
+            children_nodes = []
+            left_count = 0
+            right_count = 0
+
+            # 递归处理左子树
+            if 'left_child' in node_data:
+                l_nodes, l_cnt = self._parse_node_with_counts(
+                    node_data['left_child'], tree_index, leaf_counts, 
+                    depth + 1, current_node.get('split_index'), 'left_child'
+                )
+                children_nodes.extend(l_nodes)
+                left_count = l_cnt
+            
+            # 递归处理右子树
+            if 'right_child' in node_data:
+                r_nodes, r_cnt = self._parse_node_with_counts(
+                    node_data['right_child'], tree_index, leaf_counts, 
+                    depth + 1, current_node.get('split_index'), 'right_child'
+                )
+                children_nodes.extend(r_nodes)
+                right_count = r_cnt
+
+            # === 核心逻辑：父节点样本数 = 左子数 + 右子数 ===
+            current_node['sample_count'] = left_count + right_count
+            
+            # 将当前节点放在列表最前面（或者最后，看你喜欢的顺序，这里放最前代表层级结构）
+            full_list = [current_node] + children_nodes
+            
+            return full_list, current_node['sample_count']
+
+    def get_nodes_with_sample_counts(self, X_data):
+        """
+        输入一组数据，返回带有 'sample_count' (样本覆盖数) 的节点 DataFrame。
+        
+        :param X_data: pandas DataFrame 或 numpy array，用于计算流向的样本
+        :return: DataFrame
+        """
+        # 1. 使用 LightGBM 高效接口预测叶子节点索引
+        # 返回形状: (n_samples, n_trees)，值为 leaf_index
+        print("正在预测样本叶子节点路径...")
+        leaf_preds = self.booster.predict(X_data, pred_leaf=True)
+        
+        all_nodes = []
+        
+        # 2. 遍历每一棵树
+        for i, tree in enumerate(self.trees):
+            # 获取当前树所有样本落入的叶子节点索引
+            current_tree_leaves = leaf_preds[:, i]
+            
+            # 统计每个叶子的样本数，例如: {0: 50, 1: 30, ...}
+            # key 是 leaf_index, value 是样本数
+            leaf_counts = dict(Counter(current_tree_leaves))
+            
+            # 3. 带着计数器重新解析树结构
+            tree_structure = tree['tree_structure']
+            tree_nodes, _ = self._parse_node_with_counts(
+                tree_structure, 
+                tree_index=i, 
+                leaf_counts=leaf_counts
+            )
+            all_nodes.extend(tree_nodes)
+            
+        df = pd.DataFrame(all_nodes)
+        
+        # 增加一列占比 (Pct)，方便看比例
+        n_samples = len(X_data)
+        df['sample_pct'] = df['sample_count'] / n_samples
+        
+        return df
+
+    def get_feature_names(self):
+        return self.booster.feature_name()
+    
+    def print_tree_structure(self, tree_index=0):
+        """
+        以文本形式打印指定树的结构
+        """
+        if tree_index >= len(self.trees):
+            print(f"Error: Model only has {len(self.trees)} trees.")
+            return
+
+        tree = self.trees[tree_index]['tree_structure']
+        feature_names = self.get_feature_names()
+
+        def _print_recursive(node, indent=""):
+            if 'leaf_index' in node:
+                print(f"{indent}L-> Leaf: val={node['leaf_value']:.4f}, count={node['leaf_count']}")
+            else:
+                feat_idx = node['split_feature']
+                feat_name = feature_names[feat_idx] if feat_idx < len(feature_names) else str(feat_idx)
+                threshold = node['threshold']
+                operator = "<=" if node.get('decision_type') != '==' else "is"
+                
+                print(f"{indent}[{feat_name}] {operator} {threshold:.4f} (gain={node['split_gain']:.2f})")
+                
+                print(f"{indent} ├─(Yes)─", end="")
+                _print_recursive(node['left_child'], indent + " │       ")
+                
+                print(f"{indent} └─(No)──", end="")
+                _print_recursive(node['right_child'], indent + "         ")
+
+        print(f"Structure for Tree {tree_index}:")
+        _print_recursive(tree)
